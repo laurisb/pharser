@@ -1,0 +1,27 @@
+{
+    "name": "laurisb/pharser",
+    "description": "PHARser - Fast OpenStreetMap Node Importer for MySQL",
+    "type": "project",
+    "license": "MIT",
+    "autoload": {
+        "psr-4": {
+            "App\\": "src/",
+            "GPBMetadata\\": "gen/GPBMetadata/",
+            "OSMPBF\\": "gen/OSMPBF/"
+        }
+    },
+    "authors": [
+        {
+            "name": "Lauris Binde",
+            "email": "lauris@lauris.lv",
+            "homepage": "https://github.com/laurisb"
+        }
+    ],
+    "minimum-stability": "stable",
+    "require": {
+        "symfony/console": "^7.3"
+    },
+    "config": {
+        "classmap-authoritative": true
+    }
+}

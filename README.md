@@ -1,36 +1,36 @@
 # PHARser - Fast OpenStreetMap Node Importer for MySQL
 
-PHARser is a fast and efficient tool that extracts node coordinates and tag data from OpenStreetMap PBF files and loads them into MySQL database, enabling location-based searches, geographic and statistical analysis using SQL queries.
+PHARser is a fast and efficient tool that extracts node coordinates and tag data from OpenStreetMap PBF files and loads them into a MySQL database, enabling location-based searches and geospatial and statistical analyses using SQL queries.
 
-Works with full Planet OSM datasets and regional extracts.
+It works with full Planet OSM datasets and regional extracts.
 
 ## How it works
 
-PHARser works in three steps:
+PHARser runs in three stages:
 
-* **Parsing** - Reads the compressed map data file and extracts node coordinates and associated tag data
-* **Importing** - Loads the extracted data into the database
-* **Indexing** - Optimizes the database for optimal query performance
+* **Parsing** - Reads the compressed map data file and extracts node coordinates and tag data; each worker thread writes directly to its own pair of CSV files, with no shared state between workers
+* **Importing** - Loads node and tag CSV files into the database; nodes and tags are imported concurrently in separate threads
+* **Indexing** - Builds node and tag indexes in parallel, then removes temporary files
 
 This creates two database tables:
 
 * `node` - Contains node ID, latitude and longitude coordinates
-* `tag` - Contains node ID, tag key and value
+* `tag` - Contains node ID, tag name and value
 
 ## Requirements
 
 ### Software requirements
 
 * **Operating system** - Windows, Linux or macOS
-* **PHP** - Latest PHP (version 8.4) is recommended, with `protobuf`, `parallel` and `pdo_mysql` extensions enabled
-* **MySQL** - Latest MySQL (version 9) is recommended, with local data loading enabled (`local_infile=1`)
+* **PHP** - PHP 8.5 is recommended, with `parallel` and `pdo_mysql` extensions enabled
+* **MySQL** - MySQL 9 is recommended, with local data loading enabled (`local_infile=1`)
 
 ### Data requirements
 
 Download OpenStreetMap data files from:
 
 * [Planet OpenStreetMap](https://planet.openstreetmap.org/) - Complete world data (very large, 80+ GB)
-* [Geofabrik](https://download.geofabrik.de/) - Regional extracts (smaller, continent/country/state specific)
+* [Geofabrik](https://download.geofabrik.de/) - Regional extracts (smaller, continent/country/state-specific)
 
 ### Storage requirements
 
@@ -55,18 +55,24 @@ chmod +x pharser.phar
 php pharser.phar --version
 ```
 
-Create a database:
-
-```sql
-CREATE DATABASE `osm` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
-```
-
 ## Usage
 
 ### Basic usage
 
 ```bash
-php pharser.phar /path/to/file.osm.pbf --db-host=localhost --db-port=3306 --db-user=root --db-pass=hunter2 --db-name=osm
+php pharser.phar --db-host=localhost --db-port=3306 --db-user=root --db-pass=hunter2 --db-name=osm /path/to/file.osm.pbf
+```
+
+The `--threads` option increases parallelism (default: 2):
+
+```bash
+php pharser.phar --threads=4 /path/to/file.osm.pbf
+```
+
+The `--skip-indexing` option skips index creation (useful when indexes will be added later):
+
+```bash
+php pharser.phar --skip-indexing /path/to/file.osm.pbf
 ```
 
 ### Advanced options
@@ -80,39 +86,135 @@ php pharser.phar --help
 ### Statistical analysis
 
 ```sql
--- Find the most common tags
-SELECT `name`, COUNT(*) AS `cnt`
+-- Count how many times each tag name appears
+CREATE TABLE `tag_name_summary` (
+    `name` VARCHAR(50)  NOT NULL,
+    `cnt` INT UNSIGNED NOT NULL,
+    PRIMARY KEY (`name`)
+);
+
+INSERT INTO `tag_name_summary`
+SELECT `name`, COUNT(`node_id`)
 FROM `tag`
-GROUP BY `name`
-ORDER BY `cnt` DESC, `name` ASC;
+GROUP BY `name`;
 ```
 
 ```sql
--- Find all possible values for a specific tag
-SELECT `value`, COUNT(*) AS `cnt`
+-- Count how many times each exact name/value pair appears
+CREATE TABLE `tag_name_value_summary` (
+    `name` VARCHAR(50)  NOT NULL,
+    `value` VARCHAR(200) NOT NULL,
+    `cnt` INT UNSIGNED NOT NULL,
+    PRIMARY KEY (`name`, `value`)
+);
+
+INSERT INTO `tag_name_value_summary`
+SELECT `name`, `value`, COUNT(`node_id`)
 FROM `tag`
-WHERE `name` = 'amenity'
-GROUP BY `value`
-ORDER BY `cnt` DESC, `value` ASC;
+GROUP BY `name`, `value`;
+```
+
+```sql
+-- Count how many times each tag value appears, regardless of name
+CREATE TABLE `tag_value_summary` (
+    `value` VARCHAR(200) NOT NULL,
+    `cnt` INT UNSIGNED NOT NULL,
+    PRIMARY KEY (`value`)
+);
+
+INSERT INTO `tag_value_summary`
+SELECT `value`, COUNT(`node_id`)
+FROM `tag`
+GROUP BY `value`;
+```
+
+```sql
+-- For each tag name, show how often each value appears and what share of that name it represents
+CREATE TABLE `tag_value_distribution_summary` (
+    `name` VARCHAR(50)  NOT NULL,
+    `value` VARCHAR(200) NOT NULL,
+    `cnt` INT UNSIGNED NOT NULL,
+    `pct` DECIMAL(5,2) NOT NULL,
+    PRIMARY KEY (`name`, `value`),
+    INDEX `idx_name_pct` (`name`, `pct`)
+);
+
+INSERT INTO tag_value_distribution_summary
+SELECT
+    `name`,
+    `value`,
+    COUNT(`node_id`) AS `cnt`,
+    ROUND(
+        COUNT(`node_id`) * 100.00
+        / SUM(COUNT(`node_id`)) OVER (PARTITION BY `name`),
+        2
+    ) AS `pct`
+FROM `tag`
+GROUP BY `name`, `value`;
+```
+
+```sql
+-- Group tag names that contain ':' by the part before ':' and count usage
+CREATE TABLE `tag_namespace_summary` (
+    `namespace` VARCHAR(50)  NOT NULL,
+    `distinct_names` INT UNSIGNED NOT NULL,
+    `total_uses` INT UNSIGNED NOT NULL,
+    PRIMARY KEY (`namespace`)
+);
+
+INSERT INTO `tag_namespace_summary`
+SELECT
+    SUBSTRING_INDEX(`name`, ':', 1) AS `namespace`,
+    COUNT(DISTINCT `name`) AS `distinct_names`,
+    COUNT(*) AS `total_uses`
+FROM `tag`
+WHERE `name` LIKE '%:%'
+GROUP BY `namespace`;
+```
+
+```sql
+-- Count how many tags each node has
+CREATE TABLE `node_tag_count_summary` (
+    `node_id` BIGINT UNSIGNED NOT NULL,
+    `tag_count` INT UNSIGNED NOT NULL,
+    PRIMARY KEY (`node_id`),
+    INDEX `idx_count` (`tag_count`)
+);
+
+INSERT INTO `node_tag_count_summary`
+SELECT
+    `node_id`,
+    COUNT(*) AS `tag_count`
+FROM `tag`
+GROUP BY `node_id`;
 ```
 
 ### Location-based queries
 
 ```sql
--- Restaurants in Manhattan, New York
-SELECT `nodeId`, `name`, `value`
+-- All tags for restaurant nodes in Manhattan, New York
+SELECT `node_id`, `name`, `value`
 FROM `tag`
-WHERE `nodeId` IN (
-    SELECT `nodeId`
+WHERE `node_id` IN (
+    SELECT `node_id`
     FROM `tag`
     WHERE `name` = 'amenity' AND `value` = 'restaurant'
-) AND `nodeId` IN (
-    SELECT `nodeId`
+) AND `node_id` IN (
+    SELECT `node_id`
     FROM `node`
     WHERE `lat` BETWEEN 40.7000 AND 40.8000 AND `lon` BETWEEN -74.0200 AND -73.9300
 )
-ORDER BY `nodeId` ASC, `name` ASC;
+ORDER BY `node_id` ASC, `name` ASC;
 ```
+
+The example above uses standard coordinate range queries on lat and lon instead of spatial functions and spatial indexes. PHARser omits spatial columns and indexes by default because they increase import time and storage overhead; they can be added later when the workload benefits from them.
+
+If high-performance spatial queries are needed:
+
+* Add a `geom` column `ALTER TABLE node ADD COLUMN geom POINT SRID 4326 NULL;`
+* Backfill it with `UPDATE node SET geom = ST_SRID(POINT(lon, lat), 4326);`
+* Add a spatial index: `ALTER TABLE node ADD SPATIAL INDEX idx_geom (geom);`
+* Then use [spatial functions](https://dev.mysql.com/doc/refman/9.6/en/spatial-function-reference.html) in queries
 
 ## Performance optimization
 
@@ -125,62 +227,31 @@ PHARser works faster on newer, more powerful computers. Processing time depends 
 Optimize performance by configuring:
 
 * **PHP** - Increase memory limit, enable `opcache`, disable `xdebug` and unnecessary extensions
-* **MySQL** - Tune InnoDB buffer pool, optimize I/O threads, increase redo log capacity, disable double-write buffer and binary logging
+* **MySQL** - Tune InnoDB buffer pool, optimize I/O threads, increase redo log capacity, disable the doublewrite buffer and binary logging
 
 ## Benchmarks
 
-Reference benchmarks for the parsing stage:
+Import and indexing times vary significantly based on hardware, database configuration, and file size.
 
-| Region          | File Size | Processing Time |
-|-----------------|-----------|-----------------|
-| **Latvia**      | 125 MB    | 6 seconds       |
-| **Netherlands** | 1 GB      | 1.5 minutes     |
-| **Germany**     | 4 GB      | 3 minutes       |
-| **USA**         | 10 GB     | 8 minutes       |
-| **Europe**      | 30 GB     | 25 minutes      |
-| **Planet OSM**  | 80 GB     | 1 hour          |
+The figures below are for reference only and were measured in March 2026 on a PC with 24 CPU threads and 64 GB of RAM, running Windows 11.
 
-Import and indexing times vary greatly depending on hardware, database configuration, and file size.
-
-```log
-16:23:06.721 Starting to parse: C:/Users/Lauris/Desktop/latvia-latest.osm.pbf
-16:23:06.727 Using 3 threads, batch size 10000, max memory 512MB [+0.006s]
-16:23:06.730 Runtime pool initialized with 3 workers [+0.003s]
-16:23:06.731 OSM header found [+0.001s]
-16:23:06.731 Header skipped, starting to parse blocks
-16:23:09.568 Processed 1000 blocks, 310737 nodes, 920302 tags, 7649 pending nodes [+2.837s]
-16:23:13.096 Reached ways/relations at block 1855, stop reading file [+3.528s]
-16:23:13.138 Parsing complete [+0.042s]
-16:23:13.139 Total blocks read from file: 1855
-16:23:13.139 Total blocks queued for processing: 1854
-16:23:13.139 Processed blocks: 1854
-16:23:13.139 Processed nodes: 729923
-16:23:13.139 Processed tags: 3034263
-16:23:13.139 Nodes per second: 113924
-16:23:13.139 Peak memory usage: 62MB
-16:23:13.139 Parsing time: 6 seconds
-16:23:13.139 All queued blocks processed successfully
-16:23:13.140 Creating tables
-16:23:13.173 Importing nodes [+0.033s]
-16:23:16.930 Importing tags [+3.757s]
-16:23:29.552 Import completed [+12.623s]
-16:23:29.553 Cleaning up
-16:23:29.553 Creating index: 1/4
-16:23:30.942 Creating index: 2/4 [+1.389s]
-16:23:32.161 Creating index: 3/4 [+1.219s]
-16:23:44.032 Creating index: 4/4 [+11.871s]
-16:23:49.317 Indexing completed [+5.285s]
-```
+| Region          | File size | Parsing time | Import time | Indexing time | Total time | Nodes       | Tags        |
+|-----------------|-----------|--------------|-------------| --------------|------------|-------------|-------------|
+| **Latvia**      | 130 MB    | 1s           | 16s         | 12s           | 30s        | 762,893     | 3,131,971   |
+| **Germany**     | 4.4 GB    | 1m 6s        | 7m 25s      | 5m 47s        | 14m 18s    | 21,210,917  | 78,603,353  |
+| **Europe**      | 31.7 GB   | 10m 31s      | 50m 19s     | 50m 26s       | 1h 51m 17s | 149,112,705 | 510,720,116 |
+| **Planet OSM**  | 85.4 GB   | 29m 40s      | 1h 33m 50s  | 1h 40m 41s    | 3h 41m 39s | 283,656,315 | 981,956,523 |
 
 ## Technical notes
 
-* **Data format** - Only works with standard OpenStreetMap PBF files
+* **Data format** - Works only with standard OpenStreetMap PBF files
 * **Compression** - Files must use zlib compression (standard for OSM data)
+* **Protobuf parsing** - Uses a custom binary protobuf parser tuned for the OSM PBF schema
 * **File quality** - PBF files must be well-formed (not corrupted)
-* **Error handling** - Minimal error handling for maximum performance
 
 ## Changelog
 
+* **2026-03-26** - Parser overhaul `v2.0.0`
 * **2025-07-03** - Initial release `v1.0.0`
 
 ## License

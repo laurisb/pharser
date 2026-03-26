@@ -1,0 +1,37 @@
+name: Release
+
+on:
+  release:
+    types: [created]
+
+jobs:
+  build:
+    name: Build and upload PHAR
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.5'
+          ini-values: phar.readonly=Off
+          tools: composer
+
+      - name: Install dependencies
+        run: composer install --no-dev --optimize-autoloader --no-interaction
+
+      - name: Build PHAR
+        run: |
+          php -r "
+            \$p = new Phar('pharser.phar');
+            \$p->buildFromDirectory('.', '/\/(bin|src|vendor)\//');
+            \$p->setStub(\$p->createDefaultStub('bin/console.php'));
+          "
+
+      - name: Upload PHAR to release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: pharser.phar

@@ -5,28 +5,33 @@ declare(strict_types=1);
 namespace App;
 
 use InvalidArgumentException;
-use OSMPBF\Blob;
-use OSMPBF\BlobHeader;
-use OSMPBF\PrimitiveBlock;
-use parallel\Future;
+use parallel\Channel;
+use parallel\Channel\Error\Closed;
 use parallel\Runtime;
+use parallel\Sync;
 use RuntimeException;
+use Throwable;
 
-use function array_merge;
-use function array_shift;
-use function array_values;
 use function count;
+use function fclose;
 use function feof;
 use function fopen;
 use function fread;
+use function fwrite;
 use function gzuncompress;
 use function is_file;
+use function is_resource;
+use function is_string;
+use function max;
+use function mb_convert_encoding;
+use function mb_substr;
 use function memory_get_peak_usage;
 use function microtime;
 use function number_format;
-use function range;
 use function round;
+use function str_replace;
 use function strlen;
+use function uniqid;
 use function unpack;
 
 final class Parser
@@ -34,36 +39,18 @@ final class Parser
     /** @var resource */
     private $file;
 
-    private int $maxMemoryUsage;
+    /** @var list<string> */
+    private array $nodeCsvFiles = [];
 
-    /**
-     * @var array<int, array{future: Future, runtime_index: int}>
-     */
-    private array $futures = [];
-
-    private int $processedBlocks = 0;
-    private int $processedNodes = 0;
-    private int $processedTags = 0;
-
-    /**
-     * @var Runtime[]
-     */
-    private array $runtimePool = [];
-
-    /**
-     * @var array<int, array{id: int, lat: float, lon: float, tags: array<string, string>}>
-     */
-    private array $pendingNodes = [];
-
-    private int $currentMemoryUsage = 0;
+    /** @var list<string> */
+    private array $tagCsvFiles = [];
 
     public function __construct(
         string $pbfFile,
-        private Writer $writer,
+        private string $nodeCsvBase,
+        private string $tagCsvBase,
         private Logger $logger,
         private int $numThreads,
-        private int $batchSize = 10_000,
-        int $maxMemoryMB = 512,
     ) {
         if (!is_file($pbfFile)) {
             throw new InvalidArgumentException("PBF file not found: {$pbfFile}");
@@ -76,320 +63,368 @@ final class Parser
         }
 
         $this->file = $fp;
-        $this->maxMemoryUsage = $maxMemoryMB * 1_024 * 1_024;
 
-        $this->logger->__invoke("Using {$numThreads} threads, batch size {$batchSize}, max memory {$maxMemoryMB}MB");
+        $this->logger->__invoke('Using ' . number_format($numThreads) . " parser threads");
+    }
 
-        for ($i = 0; $i < $this->numThreads; $i++) {
-            $this->runtimePool[] = new Runtime(__DIR__ . '/../vendor/autoload.php');
+    public function __destruct()
+    {
+        if (!is_resource($this->file)) {
+            return;
         }
 
-        $this->logger->__invoke("Runtime pool initialized with {$this->numThreads} workers");
+        fclose($this->file);
+    }
+
+    /**
+     * @return list<string>
+     **/
+    public function getNodeCsvFiles(): array
+    {
+        return $this->nodeCsvFiles;
+    }
+
+    /**
+     * @return list<string>
+     **/
+    public function getTagCsvFiles(): array
+    {
+        return $this->tagCsvFiles;
     }
 
     public function parse(): void
     {
+        $channelId = uniqid('pharser_', true);
+        $blockChannel = Channel::make("{$channelId}_blocks", $this->numThreads * 16);
+        $stopFlag = new Sync(false);
+        $autoloadPath = __DIR__ . '/../vendor/autoload.php';
+        $numThreads = $this->numThreads;
+        $nodeCsvFiles = [];
+        $tagCsvFiles = [];
+
+        for ($i = 0; $i < $numThreads; $i++) {
+            $nodeCsvFiles[] = "{$this->nodeCsvBase}.{$i}";
+            $tagCsvFiles[] = "{$this->tagCsvBase}.{$i}";
+
+            $this->nodeCsvFiles[] = $nodeCsvFiles[$i];
+            $this->tagCsvFiles[] = $tagCsvFiles[$i];
+        }
+
+        $workerRuntimes = [];
+        $workerFutures = [];
+
+        for ($i = 0; $i < $numThreads; $i++) {
+            $runtime = new Runtime($autoloadPath);
+
+            $workerRuntimes[] = $runtime;
+
+            $workerFutures[] = $runtime->run(
+                static function (
+                    Channel $blockCh,
+                    Sync $stop,
+                    string $nodeCsvPath,
+                    string $tagCsvPath,
+                ): array {
+                    $fpNodes = fopen($nodeCsvPath, 'w');
+                    $fpTags = fopen($tagCsvPath, 'w');
+
+                    $processedBlocks = 0;
+                    $processedNodes = 0;
+                    $processedTags = 0;
+                    $errors = 0;
+                    $waysFound = false;
+
+                    while (true) {
+                        try {
+                            $blobData = $blockCh->recv();
+                        } catch (Closed) {
+                            break;
+                        } catch (Throwable) {
+                            $errors++;
+
+                            break;
+                        }
+
+                        if ($blobData === null) {
+                            break;
+                        }
+
+                        if ($waysFound) {
+                            continue;
+                        }
+
+                        if (!is_string($blobData)) {
+                            continue;
+                        }
+
+                        $zlibData = BinaryParser::extractZlibData($blobData);
+
+                        unset($blobData);
+
+                        $rawData = gzuncompress($zlibData);
+
+                        unset($zlibData);
+
+                        if ($rawData === false) {
+                            continue;
+                        }
+
+                        $block = BinaryParser::parsePrimitiveBlock($rawData);
+
+                        unset($rawData);
+
+                        $hasWays = false;
+                        $strings = $block['strings'];
+                        $stCount = count($strings);
+                        $stringsKey = [];
+                        $stringsVal = [];
+
+                        foreach ($strings as $s) {
+                            $clean = mb_convert_encoding($s, 'UTF-8', 'UTF-8');
+                            $stringsKey[] = mb_substr($clean, 0, 50, 'UTF-8');
+
+                            $stringsVal[] = str_replace(
+                                ["\n", "\t"],
+                                [' ', ' '],
+                                mb_substr($clean, 0, 200, 'UTF-8'),
+                            );
+                        }
+
+                        unset($strings);
+
+                        $granularity = $block['granularity'];
+                        $latOffset = $block['lat_offset'];
+                        $lonOffset = $block['lon_offset'];
+                        $nodeBuffer = '';
+                        $tagBuffer = '';
+
+                        foreach ($block['groups'] as $group) {
+                            if ($group['type'] === 'ways' || $group['type'] === 'relations') {
+                                $hasWays = true;
+
+                                break;
+                            }
+
+                            if ($group['type'] !== 'dense') {
+                                continue;
+                            }
+
+                            $ids = $group['ids'];
+                            $lats = $group['lats'];
+                            $lons = $group['lons'];
+                            $keysVals = $group['keysVals'];
+                            $nodeCount = count($ids);
+                            $keysValsCount = count($keysVals);
+                            $id = 0;
+                            $lat = 0;
+                            $lon = 0;
+                            $keysValsIdx = 0;
+
+                            for ($n = 0; $n < $nodeCount; $n++) {
+                                $id += $ids[$n];
+                                $lat += $lats[$n];
+                                $lon += $lons[$n];
+
+                                $tagCount = 0;
+                                $tagPart = '';
+
+                                while ($keysValsIdx < $keysValsCount && $keysVals[$keysValsIdx] !== 0) {
+                                    $keyIdx = $keysVals[$keysValsIdx++];
+                                    $valIdx = $keysValsIdx < $keysValsCount ? $keysVals[$keysValsIdx++] : 0;
+
+                                    if ($keyIdx >= $stCount || $valIdx >= $stCount) {
+                                        continue;
+                                    }
+
+                                    $tagCount++;
+                                    $tagPart .= "{$id}\t{$stringsKey[$keyIdx]}\t{$stringsVal[$valIdx]}\n";
+                                }
+
+                                if ($keysValsIdx < $keysValsCount) {
+                                    $keysValsIdx++;
+                                }
+
+                                if ($tagCount <= 0) {
+                                    continue;
+                                }
+
+                                $processedNodes++;
+                                $processedTags += $tagCount;
+                                $nodeLat = ($latOffset + ($granularity * $lat)) * 1e-9;
+                                $nodeLon = ($lonOffset + ($granularity * $lon)) * 1e-9;
+                                $nodeBuffer .= "{$id}\t{$nodeLat}\t{$nodeLon}\n";
+                                $tagBuffer .= $tagPart;
+                            }
+                        }
+
+                        if ($nodeBuffer !== '' && is_resource($fpNodes)) {
+                            fwrite($fpNodes, $nodeBuffer);
+                        }
+
+                        if ($tagBuffer !== '' && is_resource($fpTags)) {
+                            fwrite($fpTags, $tagBuffer);
+                        }
+
+                        unset($block);
+
+                        if ($hasWays) {
+                            $stop->set(true);
+
+                            $waysFound = true;
+
+                            continue;
+                        }
+
+                        $processedBlocks++;
+                    }
+
+                    if (is_resource($fpNodes) && is_resource($fpTags)) {
+                        fclose($fpNodes);
+                        fclose($fpTags);
+                    }
+
+                    return [
+                        'blocks' => $processedBlocks,
+                        'nodes' => $processedNodes,
+                        'tags' => $processedTags,
+                        'errors' => $errors,
+                    ];
+                },
+                [$blockChannel, $stopFlag, $nodeCsvFiles[$i], $tagCsvFiles[$i]],
+            );
+        }
+
         $this->skipHeader();
 
         $this->logger->__invoke('Header skipped, starting to parse blocks');
 
         $startTime = microtime(true);
 
-        /** @var string[] */
-        $blockQueue = [];
-
-        $activeJobs = 0;
-        $maxQueueSize = $this->numThreads * 2;
         $totalBlocksRead = 0;
-        $blocksQueued = 0;
-        $fileReadingComplete = false;
+        $lastProgressTime = $startTime;
 
-        /**
-         * @var int[]
-         */
-        $availableRuntimes = range(0, $this->numThreads - 1);
-
-        $runtimeInUse = [];
-
-        while (true) {
-            // STEP 1: Read blocks from file, with memory pressure check
-            if (!$fileReadingComplete && $this->currentMemoryUsage < $this->maxMemoryUsage) {
-                $blocksReadThisIteration = 0;
-                $maxBlocksPerIteration = 50;
-
-                while (
-                    !feof($this->file)
-                    && count($blockQueue) < $maxQueueSize
-                    && $blocksReadThisIteration < $maxBlocksPerIteration
-                    && $this->currentMemoryUsage < $this->maxMemoryUsage
-                ) {
-                    $header = $this->readBlobHeader();
-                    $blob = $this->readBlob($header->getDatasize());
-                    $totalBlocksRead++;
-                    $blocksReadThisIteration++;
-
-                    if (!$this->blockContainsNodes($blob)) {
-                        $this->logger->__invoke("Reached ways/relations at block {$totalBlocksRead}, stop reading file");
-
-                        $fileReadingComplete = true;
-
-                        break;
-                    }
-
-                    $serializedBlob = $blob->serializeToString();
-                    $blockQueue[] = $serializedBlob;
-                    $this->currentMemoryUsage += strlen($serializedBlob);
-                }
-            }
-
-            // STEP 2: Start new jobs with runtime reuse
-            while (count($blockQueue) > 0 && count($availableRuntimes) > 0) {
-                $blobData = array_shift($blockQueue);
-                $this->currentMemoryUsage -= strlen($blobData);
-
-                $runtimeIndex = array_shift($availableRuntimes);
-                $runtime = $this->runtimePool[$runtimeIndex];
-
-                $future = $this->processBlockAsyncWithRuntime($blobData, $runtime);
-                $this->futures[] = ['future' => $future, 'runtime_index' => $runtimeIndex];
-                $activeJobs++;
-                $blocksQueued++;
-                $runtimeInUse[$runtimeIndex] = true;
-            }
-
-            // STEP 3: Collect completed results (non-blocking)
-            $this->collectCompletedResults($activeJobs, $availableRuntimes, $runtimeInUse);
-
-            // STEP 4: Batch write nodes if we have enough
-            if (count($this->pendingNodes) >= $this->batchSize) {
-                $this->flushPendingNodes();
-            }
-
-            // STEP 5: Check if we should continue
-            if ($fileReadingComplete && count($blockQueue) === 0 && $activeJobs === 0) {
+        while (!feof($this->file)) {
+            if ((bool) $stopFlag->get()) {
+                $this->logger->__invoke(
+                    'Reached ways/relations at block ' . number_format($totalBlocksRead) . ', stop reading file',
+                );
                 break;
             }
-        }
 
-        $this->flushPendingNodes();
+            $header = $this->readBlobHeader();
 
-        $endTime = microtime(true);
-        $duration = $endTime - $startTime;
-
-        $this->logger->__invoke('Parsing complete');
-        $this->logger->__invoke("Total blocks read from file: {$totalBlocksRead}");
-        $this->logger->__invoke("Total blocks queued for processing: {$blocksQueued}");
-        $this->logger->__invoke("Processed blocks: {$this->processedBlocks}");
-        $this->logger->__invoke("Processed nodes: {$this->processedNodes}");
-        $this->logger->__invoke("Processed tags: {$this->processedTags}");
-        $this->logger->__invoke('Nodes per second: ' . round($this->processedNodes / $duration));
-        $this->logger->__invoke('Peak memory usage: ' . round(memory_get_peak_usage(true) / 1_024 / 1_024, 1) . 'MB');
-        $this->logger->__invoke('Parsing time: ' . round($duration) . ' seconds');
-
-        if ($this->processedBlocks !== $blocksQueued) {
-            throw new RuntimeException("Processed blocks ({$this->processedBlocks}) != Queued blocks ({$blocksQueued})");
-        }
-
-        $this->logger->__invoke('All queued blocks processed successfully');
-    }
-
-    private function processBlockAsyncWithRuntime(
-        string $blobData,
-        Runtime $runtime,
-    ): Future {
-        return $runtime->run(function (string $serializedBlob): array {
-            $nodes = [];
-
-            $blob = new Blob();
-            $blob->mergeFromString($serializedBlob);
-
-            $data = gzuncompress($blob->getZlibData());
-
-            $primitiveBlock = new PrimitiveBlock();
-            $primitiveBlock->mergeFromString($data);
-
-            $granularity = $primitiveBlock->getGranularity() ?: 100;
-            $latOffset = $primitiveBlock->getLatOffset() ?: 0;
-            $lonOffset = $primitiveBlock->getLonOffset() ?: 0;
-            $stringTable = $primitiveBlock->getStringtable()->getS();
-            $stringTableCount = count($stringTable ?? []);
-
-            foreach ($primitiveBlock->getPrimitivegroup() as $group) {
-                $denseNodes = $group->getDense();
-                $ids = $denseNodes->getId();
-                $lats = $denseNodes->getLat();
-                $lons = $denseNodes->getLon();
-                $keysVals = $denseNodes->getKeysVals();
-
-                $nodeCount = count($ids);
-                $keysValsCount = count($keysVals);
-
-                $id = 0;
-                $lat = 0;
-                $lon = 0;
-                $keysValsIndex = 0;
-
-                for ($i = 0; $i < $nodeCount; $i++) {
-                    $id += $ids[$i];
-                    $lat += $lats[$i];
-                    $lon += $lons[$i];
-
-                    $nodeLat = ($latOffset + ($granularity * $lat)) * 1e-9;
-                    $nodeLon = ($lonOffset + ($granularity * $lon)) * 1e-9;
-
-                    $tags = [];
-
-                    while ($keysValsIndex < $keysValsCount && $keysVals[$keysValsIndex] !== 0) {
-                        $keyIndex = $keysVals[$keysValsIndex++];
-                        $valIndex = $keysValsIndex < $keysValsCount ? $keysVals[$keysValsIndex++] : 0;
-
-                        if ($keyIndex < $stringTableCount && $valIndex < $stringTableCount) {
-                            $tags[$stringTable[$keyIndex]] = $stringTable[$valIndex];
-                        }
-                    }
-
-                    if ($keysValsIndex < $keysValsCount && $keysVals[$keysValsIndex] === 0) {
-                        $keysValsIndex++;
-                    }
-
-                    if (count($tags) > 0) {
-                        $nodes[] = [
-                            'id' => $id,
-                            'lat' => $nodeLat,
-                            'lon' => $nodeLon,
-                            'tags' => $tags,
-                        ];
-                    }
-                }
+            if ($header === null) {
+                break;
             }
 
-            return $nodes;
-        }, [$blobData]);
-    }
+            $blobData = $this->readBlob($header['datasize']);
 
-    /**
-     * @param int[] $availableRuntimes
-     * @param array<int, bool> $runtimeInUse
-     */
-    private function collectCompletedResults(
-        int &$activeJobs,
-        array &$availableRuntimes,
-        array &$runtimeInUse,
-    ): void {
-        $completedFutures = [];
-        $completedCount = 0;
+            if ($blobData === null) {
+                break;
+            }
 
-        foreach ($this->futures as $key => $futureData) {
-            $future = $futureData['future'];
-            $runtimeIndex = $futureData['runtime_index'];
+            $totalBlocksRead++;
 
-            if (!$future->done()) {
+            $blockChannel->send($blobData);
+
+            $now = microtime(true);
+
+            if ($now - $lastProgressTime < 30.0) {
                 continue;
             }
 
-            $completedFutures[] = $key;
-            $activeJobs--;
-            $completedCount++;
+            $lastProgressTime = $now;
+            $this->logger->__invoke('Read ' . number_format($totalBlocksRead) . ' blocks from file');
+        }
 
-            $availableRuntimes[] = $runtimeIndex;
-            unset($runtimeInUse[$runtimeIndex]);
+        $blockChannel->close();
 
-            $nodes = $future->value();
+        $processedBlocks = 0;
+        $processedNodes = 0;
+        $processedTags = 0;
+        $processedErrors = 0;
 
-            $this->processedBlocks++;
-            $this->processedNodes += count($nodes);
-
-            foreach ($nodes as $node) {
-                $this->processedTags += count($node['tags']);
+        foreach ($workerFutures as $future) {
+            if ($future === null) {
+                continue;
             }
 
-            $this->pendingNodes = array_merge($this->pendingNodes, $nodes);
-
-            if ($this->processedBlocks % 1_000 === 0) {
-                $this->logger->__invoke("Processed {$this->processedBlocks} blocks, {$this->processedNodes} nodes, {$this->processedTags} tags, " . count($this->pendingNodes) . " pending nodes");
-            }
+            /** @var array{blocks: int, nodes: int, tags: int, errors: int} $stats */
+            $stats = $future->value();
+            $processedBlocks += $stats['blocks'];
+            $processedNodes += $stats['nodes'];
+            $processedTags += $stats['tags'];
+            $processedErrors += $stats['errors'];
         }
 
-        foreach ($completedFutures as $key) {
-            unset($this->futures[$key]);
-        }
+        $endTime = microtime(true);
+        $duration = $endTime - $startTime;
+        $nodesPerSecond = number_format(round($processedNodes / max($duration, 0.001)));
+        $peakMemory = number_format(memory_get_peak_usage(true) / 1_024 / 1_024, 1);
 
-        if (count($completedFutures) > 0) {
-            $this->futures = array_values($this->futures);
-        }
-    }
-
-    private function flushPendingNodes(): void
-    {
-        if (count($this->pendingNodes) === 0) {
-            return;
-        }
-
-        $this->writer->__invoke($this->pendingNodes);
-        $this->pendingNodes = [];
+        $this->logger->__invoke('Parsing complete');
+        $this->logger->__invoke('Blocks processed: ' . number_format($processedBlocks));
+        $this->logger->__invoke('Nodes: ' . number_format($processedNodes));
+        $this->logger->__invoke('Tags: ' . number_format($processedTags));
+        $this->logger->__invoke('Nodes per second: ' . $nodesPerSecond);
+        $this->logger->__invoke('Peak memory: ' . $peakMemory . ' MB');
+        $this->logger->__invoke('Worker errors: ' . number_format($processedErrors));
+        $this->logger->__invoke('Parsing time: ' . number_format(round($duration)) . ' seconds');
     }
 
     private function skipHeader(): void
     {
         $header = $this->readBlobHeader();
 
-        if ($header === null || $header->getType() !== 'OSMHeader') {
+        if ($header === null || $header['type'] !== 'OSMHeader') {
             throw new RuntimeException('Failed to read OSM header');
         }
 
-        $this->readBlob($header->getDatasize());
+        $this->readBlob($header['datasize']);
 
         $this->logger->__invoke('OSM header found');
     }
 
-    private function readBlobHeader(): ?BlobHeader
+    /**
+     * @return array{type: string, datasize: int}|null
+     */
+    private function readBlobHeader(): ?array
     {
         $headerSizeData = fread($this->file, 4);
 
-        if (strlen($headerSizeData) < 4) {
+        if ($headerSizeData === false || strlen($headerSizeData) < 4) {
             return null;
         }
 
-        $headerSize = unpack('N', $headerSizeData)[1];
+        $unpacked = unpack('N', $headerSizeData);
+
+        if ($unpacked === false) {
+            return null;
+        }
+
+        /** @var int<1, max> $headerSize */
+        $headerSize = $unpacked[1];
         $headerData = fread($this->file, $headerSize);
 
-        if (strlen($headerData) < $headerSize) {
+        if ($headerData === false || strlen($headerData) < $headerSize) {
             return null;
         }
 
-        $header = new BlobHeader();
-        $header->mergeFromString($headerData);
-
-        return $header;
+        return BinaryParser::parseBlobHeader($headerData);
     }
 
-    private function readBlob(int $size): ?Blob
+    private function readBlob(int $size): ?string
     {
+        if ($size < 1) {
+            return null;
+        }
+
         $blobData = fread($this->file, $size);
 
-        if (strlen($blobData) < $size) {
+        if ($blobData === false || strlen($blobData) < $size) {
             return null;
         }
 
-        $blob = new Blob();
-        $blob->mergeFromString($blobData);
-
-        return $blob;
-    }
-
-    private function blockContainsNodes(Blob $blob): bool
-    {
-        $data = gzuncompress($blob->getZlibData());
-
-        $primitiveBlock = new PrimitiveBlock();
-        $primitiveBlock->mergeFromString($data);
-
-        foreach ($primitiveBlock->getPrimitivegroup() as $group) {
-            if ($group->getWays()->count() > 0 || $group->getRelations()->count() > 0) {
-                return false;
-            }
-        }
-
-        return true;
+        return $blobData;
     }
 }

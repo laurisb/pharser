@@ -18,33 +18,6 @@ final class Logger
     public function __construct(
         private OutputInterface $output,
     ) {
-        //
-    }
-
-    public function __invoke(string $message): void
-    {
-        $curTime = new DateTimeImmutable();
-        $milliSeconds = 0;
-
-        if ($this->lastTime !== null) {
-            $secondsDiff = $curTime->getTimestamp() - $this->lastTime->getTimestamp();
-            $microsecondsDiff = $curTime->format('u') - $this->lastTime->format('u');
-            $microSeconds = ($secondsDiff * 1_000_000) + $microsecondsDiff;
-            $milliSeconds = (int) round($microSeconds / 1_000);
-        }
-
-        $this->lastTime = $curTime;
-
-        $parts = [
-            '<info>' . $curTime->format('H:i:s.v') . '</info>',
-            $message,
-        ];
-
-        if ($milliSeconds > 0) {
-            $parts[] = '<comment>[' . $this->formatDuration($milliSeconds) . ']</comment>';
-        }
-
-        $this->output->writeln(implode(' ', $parts));
     }
 
     private function formatDuration(int $milliSeconds): string
@@ -71,5 +44,31 @@ final class Logger
         $parts[] = $remainingSeconds . 's';
 
         return '+' . implode('', $parts);
+    }
+
+    public function __invoke(string $message): void
+    {
+        $curTime = new DateTimeImmutable();
+        $milliSeconds = 0;
+
+        if ($this->lastTime !== null) {
+            $secondsDiff = $curTime->getTimestamp() - $this->lastTime->getTimestamp();
+            $microsecondsDiff = $curTime->format('u') - $this->lastTime->format('u');
+            $microSeconds = ($secondsDiff * 1_000_000) + $microsecondsDiff;
+            $milliSeconds = (int) round($microSeconds / 1_000);
+        }
+
+        $this->lastTime = $curTime;
+
+        $parts = [
+            '<info>' . $curTime->format('H:i:s.v') . '</info>',
+            $message,
+        ];
+
+        if ($milliSeconds > 0) {
+            $parts[] = '<comment>[' . $this->formatDuration($milliSeconds) . ']</comment>';
+        }
+
+        $this->output->writeln(implode(' ', $parts));
     }
 }

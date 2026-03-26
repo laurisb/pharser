@@ -4,113 +4,214 @@ declare(strict_types=1);
 
 namespace App;
 
+use InvalidArgumentException;
+use parallel\Runtime;
 use PDO;
+use Pdo\Mysql;
+
+use function preg_match;
+use function str_replace;
+use function unlink;
 
 final class Importer
 {
-    private PDO $pdo;
+    private string $dsn;
+    private string $dsnBase;
 
     public function __construct(
         private Logger $logger,
-        private string $nodeCsvFile,
-        private string $tagCsvFile,
         string $dbHost,
         int $dbPort,
-        string $dbUser,
-        string $dbPass,
-        string $dbName,
+        private string $dbUser,
+        private string $dbPass,
+        private string $dbName,
     ) {
-        $dsn = "mysql:host={$dbHost};port={$dbPort};dbname={$dbName};charset=utf8mb4";
+        if (preg_match('/[^a-zA-Z0-9_]/', $dbName) === 1) {
+            throw new InvalidArgumentException(
+                'Database name must contain only alphanumeric characters and underscores',
+            );
+        }
 
-        $this->pdo = new PDO(
-            dsn: $dsn,
-            username: $dbUser,
-            password: $dbPass,
-            options: [
-                PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION,
-                PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC,
-                PDO::ATTR_EMULATE_PREPARES => false,
-                PDO::MYSQL_ATTR_LOCAL_INFILE => true,
-            ],
+        $this->dsnBase = "mysql:host={$dbHost};port={$dbPort};charset=utf8mb4";
+        $this->dsn = "{$this->dsnBase};dbname={$dbName}";
+    }
+
+    public function createDatabase(): void
+    {
+        $pdo = new PDO(
+            dsn: $this->dsnBase,
+            username: $this->dbUser,
+            password: $this->dbPass,
+            options: [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION],
         );
+
+        $name = $this->dbName;
+
+        $pdo->exec("CREATE DATABASE IF NOT EXISTS `{$name}` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci");
+
+        $this->logger->__invoke("Database '{$name}' ready");
     }
 
     public function createTables(): void
     {
         $this->logger->__invoke('Creating tables');
 
-        $this->pdo->prepare('DROP TABLE IF EXISTS `node`')->execute();
-        $this->pdo->prepare('DROP TABLE IF EXISTS `tag`')->execute();
+        $pdo = new PDO(
+            dsn: $this->dsn,
+            username: $this->dbUser,
+            password: $this->dbPass,
+            options: [
+                PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION,
+                PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC,
+                PDO::ATTR_EMULATE_PREPARES => false,
+                Mysql::ATTR_LOCAL_INFILE => true,
+            ],
+        );
 
-        $this->pdo->prepare(<<<SQL
+        $pdo->prepare('DROP TABLE IF EXISTS `node`')->execute();
+        $pdo->prepare('DROP TABLE IF EXISTS `tag`')->execute();
+
+        $pdo->prepare(<<<SQL
 CREATE TABLE `node` (
-    `nodeId` BIGINT UNSIGNED NOT NULL,
+    `node_id` BIGINT UNSIGNED NOT NULL,
     `lat` DECIMAL(8, 6) NOT NULL,
     `lon` DECIMAL(9, 6) NOT NULL
 ) ENGINE=INNODB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
 SQL)->execute();
 
-        $this->pdo->prepare(<<<SQL
+        $pdo->prepare(<<<SQL
 CREATE TABLE `tag` (
-    `nodeId` BIGINT UNSIGNED NOT NULL,
+    `node_id` BIGINT UNSIGNED NOT NULL,
     `name` VARCHAR(50) NOT NULL,
     `value` VARCHAR(200) NOT NULL
 ) ENGINE=INNODB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
 SQL)->execute();
     }
 
-    public function import(): void
-    {
-        $this->logger->__invoke('Importing nodes');
+    /**
+     * @param list<string> $nodeFiles
+     * @param list<string> $tagFiles
+     */
+    public function import(
+        array $nodeFiles,
+        array $tagFiles,
+    ): void {
+        $this->logger->__invoke('Importing nodes and tags');
 
-        $this->pdo->exec(<<<SQL
-LOAD DATA LOCAL INFILE '{$this->nodeCsvFile}'
+        $dsn = $this->dsn;
+        $dbUser = $this->dbUser;
+        $dbPass = $this->dbPass;
+
+        $nodeRuntime = new Runtime();
+        $tagRuntime = new Runtime();
+
+        $nodeFuture = $nodeRuntime->run(
+            static function (string $dsn, string $user, string $pass, array $files): void {
+                $pdo = new PDO(
+                    dsn: $dsn,
+                    username: $user,
+                    password: $pass,
+                    options: [
+                        PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION,
+                        PDO::ATTR_EMULATE_PREPARES => false,
+                        Mysql::ATTR_LOCAL_INFILE => true,
+                    ],
+                );
+
+                foreach ($files as $file) {
+                    $escapedFile = str_replace("'", "\\'", $file);
+                    $pdo->exec(<<<SQL
+LOAD DATA LOCAL INFILE '{$escapedFile}'
 INTO TABLE `node`
 FIELDS TERMINATED BY '\t'
 LINES TERMINATED BY '\n'
 SQL);
+                    unlink($file);
+                }
+            },
+            [$dsn, $dbUser, $dbPass, $nodeFiles],
+        );
 
-        $this->logger->__invoke('Importing tags');
+        $tagFuture = $tagRuntime->run(
+            static function (string $dsn, string $user, string $pass, array $files): void {
+                $pdo = new PDO(
+                    dsn: $dsn,
+                    username: $user,
+                    password: $pass,
+                    options: [
+                        PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION,
+                        PDO::ATTR_EMULATE_PREPARES => false,
+                        Mysql::ATTR_LOCAL_INFILE => true,
+                    ],
+                );
 
-        $this->pdo->exec(<<<SQL
-LOAD DATA LOCAL INFILE '{$this->tagCsvFile}'
+                foreach ($files as $file) {
+                    $escapedFile = str_replace("'", "\\'", $file);
+                    $pdo->exec(<<<SQL
+LOAD DATA LOCAL INFILE '{$escapedFile}'
 INTO TABLE `tag`
 FIELDS TERMINATED BY '\t'
 LINES TERMINATED BY '\n'
 SQL);
+                    unlink($file);
+                }
+            },
+            [$dsn, $dbUser, $dbPass, $tagFiles],
+        );
+
+        $nodeFuture?->value();
+        $tagFuture?->value();
 
         $this->logger->__invoke('Import completed');
     }
 
     public function index(): void
     {
-        $this->logger->__invoke('Creating index: 1/4');
+        $this->logger->__invoke('Creating indexes');
 
-        $this->pdo->prepare(<<<SQL
+        $dsn = $this->dsn;
+        $dbUser = $this->dbUser;
+        $dbPass = $this->dbPass;
+        $nodeRuntime = new Runtime();
+        $tagRuntime = new Runtime();
+
+        $nodeFuture = $nodeRuntime->run(
+            static function (string $dsn, string $user, string $pass): void {
+                $pdo = new PDO(
+                    dsn: $dsn,
+                    username: $user,
+                    password: $pass,
+                    options: [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION],
+                );
+
+                $pdo->prepare(<<<SQL
 ALTER TABLE `node`
-ADD PRIMARY KEY (`nodeId`)
+ADD PRIMARY KEY (`node_id`),
+ADD KEY idx_lat_lon (`lat`, `lon`)
 SQL)->execute();
+            },
+            [$dsn, $dbUser, $dbPass],
+        );
 
-        $this->logger->__invoke('Creating index: 2/4');
+        $tagFuture = $tagRuntime->run(
+            static function (string $dsn, string $user, string $pass): void {
+                $pdo = new PDO(
+                    dsn: $dsn,
+                    username: $user,
+                    password: $pass,
+                    options: [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION],
+                );
 
-        $this->pdo->prepare(<<<SQL
-ALTER TABLE `node`
-ADD KEY idx_lat_lon (`lat`, `lon`);
-SQL)->execute();
-
-        $this->logger->__invoke('Creating index: 3/4');
-
-        $this->pdo->prepare(<<<SQL
+                $pdo->prepare(<<<SQL
 ALTER TABLE `tag`
-ADD KEY idx_name_value_nodeid (`name`, `value`, `nodeId`);
+ADD KEY `idx_name_value_node_id` (`name`, `value`, `node_id`)
 SQL)->execute();
+            },
+            [$dsn, $dbUser, $dbPass],
+        );
 
-        $this->logger->__invoke('Creating index: 4/4');
-
-        $this->pdo->prepare(<<<SQL
-ALTER TABLE `tag`
-ADD KEY idx_nodeid_name_value (`nodeId`, `name`, `value`);
-SQL)->execute();
+        $nodeFuture?->value();
+        $tagFuture?->value();
 
         $this->logger->__invoke('Indexing completed');
     }

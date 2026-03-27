@@ -5,6 +5,7 @@ declare(strict_types=1);
 use App\Importer;
 use App\Logger;
 use App\Parser;
+use InvalidArgumentException;
 use Symfony\Component\Console\Command\Command;
 use Symfony\Component\Console\Input\InputArgument;
 use Symfony\Component\Console\Input\InputInterface;
@@ -12,11 +13,25 @@ use Symfony\Component\Console\Input\InputOption;
 use Symfony\Component\Console\Output\OutputInterface;
 use Symfony\Component\Console\SingleCommandApplication;
 
+use function getenv;
+use function shell_exec;
+use function trim;
+
+use const PHP_OS_FAMILY;
+
 require __DIR__ . '/../vendor/autoload.php';
+
+$detectedThreads = match (PHP_OS_FAMILY) {
+    'Windows' => (int) getenv('NUMBER_OF_PROCESSORS'),
+    'Darwin' => (int) trim((string) shell_exec('sysctl -n hw.logicalcpu')),
+    default => (int) trim((string) shell_exec('nproc')),
+};
+
+$defaultThreads = $detectedThreads > 0 ? $detectedThreads : 1;
 
 (new SingleCommandApplication())
     ->setName('PHARser')
-    ->setVersion('2.0.0')
+    ->setVersion('2.1.0')
     ->addArgument(
         name: 'pbf',
         mode: InputArgument::REQUIRED,
@@ -55,8 +70,8 @@ require __DIR__ . '/../vendor/autoload.php';
     ->addOption(
         name: 'threads',
         mode: InputOption::VALUE_OPTIONAL,
-        description: 'Number of threads to use for parsing',
-        default: 2,
+        description: 'Number of threads to use for parsing (detected: ' . $defaultThreads . ')',
+        default: $defaultThreads,
     )
     ->addOption(
         name: 'skip-indexing',
@@ -77,6 +92,10 @@ require __DIR__ . '/../vendor/autoload.php';
             /** @var string|int $threadOpt */
             $threadOpt = $input->getOption('threads');
             $threads = (int) $threadOpt;
+
+            if ($threads < 1) {
+                throw new InvalidArgumentException('Thread count must be at least 1');
+            }
 
             $parser = new Parser(
                 pbfFile: $pbfFile,

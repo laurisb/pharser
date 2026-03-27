@@ -53,7 +53,7 @@ final class Logger
 
         if ($this->lastTime !== null) {
             $secondsDiff = $curTime->getTimestamp() - $this->lastTime->getTimestamp();
-            $microsecondsDiff = $curTime->format('u') - $this->lastTime->format('u');
+            $microsecondsDiff = (int) $curTime->format('u') - (int) $this->lastTime->format('u');
             $microSeconds = ($secondsDiff * 1_000_000) + $microsecondsDiff;
             $milliSeconds = (int) round($microSeconds / 1_000);
         }

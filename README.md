@@ -1,6 +1,8 @@
 # PHARser - Fast OpenStreetMap Node Importer for MySQL
 
-PHARser is a fast and efficient tool that extracts node coordinates and tag data from OpenStreetMap PBF files and loads them into a MySQL database, enabling location-based searches and geospatial and statistical analyses using SQL queries.
+PHARser is a fast tool that extracts node coordinates and tag data from OpenStreetMap PBF files and loads them into a MySQL database, enabling location-based searches and geospatial and statistical analyses using SQL queries.
+
+[osm2pgsql](https://osm2pgsql.org) is the de-facto standard for importing OSM data. PHARser is for those who'd rather not age like a Hobbit [waiting for it to finish](https://wiki.openstreetmap.org/wiki/Osm2pgsql/benchmarks). It can import the full planet in [under four hours](#benchmarks).
 
 It works with full Planet OSM datasets and regional extracts.
 
@@ -29,7 +31,7 @@ This creates two database tables:
 
 Download OpenStreetMap data files from:
 
-* [Planet OpenStreetMap](https://planet.openstreetmap.org/) - Complete world data (very large, 80+ GB)
+* [Planet OpenStreetMap](https://planet.openstreetmap.org/) - Complete world data (very large, 85+ GB)
 * [Geofabrik](https://download.geofabrik.de/) - Regional extracts (smaller, continent/country/state-specific)
 
 ### Storage requirements
@@ -44,7 +46,7 @@ Ensure sufficient disk space for:
 
 Download the latest `pharser.phar` from the [releases page](https://github.com/laurisb/pharser/releases/latest).
 
-```bash
+```sh
 # Download the PHAR file
 curl -L -o pharser.phar https://github.com/laurisb/pharser/releases/latest/download/pharser.phar
 
@@ -59,29 +61,37 @@ php pharser.phar --version
 
 ### Basic usage
 
-```bash
-php pharser.phar --db-host=localhost --db-port=3306 --db-user=root --db-pass=hunter2 --db-name=osm /path/to/file.osm.pbf
+By default, PHARser connects to a local MySQL server on port 3306 with the `root` user and an empty password, using the `osm` database:
+
+```sh
+php pharser.phar /path/to/planet.osm.pbf
 ```
 
-The `--threads` option increases parallelism (default: 2):
+Database connection parameters can be configured:
 
-```bash
-php pharser.phar --threads=4 /path/to/file.osm.pbf
+```sh
+php pharser.phar --db-host=db.wizard.lan --db-port=3003 --db-user=gandalf --db-pass=mellon --db-name=middle_earth /downloads/the-shire.osm.pbf
+```
+
+The `--threads` option controls parallelism (default: number of CPU threads detected on the system - maximum performance):
+
+```sh
+php pharser.phar --threads=9 /downloads/middle-earth.osm.pbf
 ```
 
 The `--skip-indexing` option skips index creation (useful when indexes will be added later):
 
-```bash
-php pharser.phar --skip-indexing /path/to/file.osm.pbf
+```sh
+php pharser.phar --skip-indexing /downloads/mordor.osm.pbf
 ```
 
 ### Advanced options
 
-```bash
+```sh
 php pharser.phar --help
 ```
 
-## Data analysis examples
+## Data analysis
 
 ### Statistical analysis
 
@@ -192,17 +202,17 @@ GROUP BY `node_id`;
 ### Location-based queries
 
 ```sql
--- All tags for restaurant nodes in Manhattan, New York
+-- All tags for pub nodes in the Shire
 SELECT `node_id`, `name`, `value`
 FROM `tag`
 WHERE `node_id` IN (
     SELECT `node_id`
     FROM `tag`
-    WHERE `name` = 'amenity' AND `value` = 'restaurant'
+    WHERE `name` = 'amenity' AND `value` = 'pub'
 ) AND `node_id` IN (
     SELECT `node_id`
     FROM `node`
-    WHERE `lat` BETWEEN 40.7000 AND 40.8000 AND `lon` BETWEEN -74.0200 AND -73.9300
+    WHERE `lat` BETWEEN -38.00 AND -37.50 AND `lon` BETWEEN 175.00 AND 176.00
 )
 ORDER BY `node_id` ASC, `name` ASC;
 ```
@@ -233,7 +243,7 @@ Optimize performance by configuring:
 
 Import and indexing times vary significantly based on hardware, database configuration, and file size.
 
-The figures below are for reference only and were measured in March 2026 on a PC with 24 CPU threads and 64 GB of RAM, running Windows 11.
+The figures below are for reference only and were measured in March 2026 on a 5-year-old custom-built Windows PC with 24 CPU threads and 64 GB of RAM.
 
 | Region          | File size | Parsing time | Import time | Indexing time | Total time | Nodes       | Tags        |
 |-----------------|-----------|--------------|-------------| --------------|------------|-------------|-------------|
@@ -242,15 +252,9 @@ The figures below are for reference only and were measured in March 2026 on a PC
 | **Europe**      | 31.7 GB   | 10m 31s      | 50m 19s     | 50m 26s       | 1h 51m 17s | 149,112,705 | 510,720,116 |
 | **Planet OSM**  | 85.4 GB   | 29m 40s      | 1h 33m 50s  | 1h 40m 41s    | 3h 41m 39s | 283,656,315 | 981,956,523 |
 
-## Technical notes
-
-* **Data format** - Works only with standard OpenStreetMap PBF files
-* **Compression** - Files must use zlib compression (standard for OSM data)
-* **Protobuf parsing** - Uses a custom binary protobuf parser tuned for the OSM PBF schema
-* **File quality** - PBF files must be well-formed (not corrupted)
-
 ## Changelog
 
+* **2026-03-27** - Restore missing index, CPU thread auto-detection `v2.1.0`
 * **2026-03-26** - Parser overhaul `v2.0.0`
 * **2025-07-03** - Initial release `v1.0.0`
 

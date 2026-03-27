@@ -98,66 +98,37 @@ SQL)->execute();
     ): void {
         $this->logger->__invoke('Importing nodes and tags');
 
-        $dsn = $this->dsn;
-        $dbUser = $this->dbUser;
-        $dbPass = $this->dbPass;
+        $importFn = static function (string $dsn, string $user, string $pass, string $table, array $files): void {
+            $pdo = new PDO(
+                dsn: $dsn,
+                username: $user,
+                password: $pass,
+                options: [
+                    PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION,
+                    PDO::ATTR_EMULATE_PREPARES => false,
+                    Mysql::ATTR_LOCAL_INFILE => true,
+                ],
+            );
+
+            foreach ($files as $file) {
+                $escapedFile = str_replace("'", "\\'", $file);
+
+                $pdo->exec(<<<SQL
+LOAD DATA LOCAL INFILE '{$escapedFile}'
+INTO TABLE `{$table}`
+FIELDS TERMINATED BY '\t'
+LINES TERMINATED BY '\n'
+SQL);
+
+                unlink($file);
+            }
+        };
 
         $nodeRuntime = new Runtime();
         $tagRuntime = new Runtime();
 
-        $nodeFuture = $nodeRuntime->run(
-            static function (string $dsn, string $user, string $pass, array $files): void {
-                $pdo = new PDO(
-                    dsn: $dsn,
-                    username: $user,
-                    password: $pass,
-                    options: [
-                        PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION,
-                        PDO::ATTR_EMULATE_PREPARES => false,
-                        Mysql::ATTR_LOCAL_INFILE => true,
-                    ],
-                );
-
-                foreach ($files as $file) {
-                    $escapedFile = str_replace("'", "\\'", $file);
-                    $pdo->exec(<<<SQL
-LOAD DATA LOCAL INFILE '{$escapedFile}'
-INTO TABLE `node`
-FIELDS TERMINATED BY '\t'
-LINES TERMINATED BY '\n'
-SQL);
-                    unlink($file);
-                }
-            },
-            [$dsn, $dbUser, $dbPass, $nodeFiles],
-        );
-
-        $tagFuture = $tagRuntime->run(
-            static function (string $dsn, string $user, string $pass, array $files): void {
-                $pdo = new PDO(
-                    dsn: $dsn,
-                    username: $user,
-                    password: $pass,
-                    options: [
-                        PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION,
-                        PDO::ATTR_EMULATE_PREPARES => false,
-                        Mysql::ATTR_LOCAL_INFILE => true,
-                    ],
-                );
-
-                foreach ($files as $file) {
-                    $escapedFile = str_replace("'", "\\'", $file);
-                    $pdo->exec(<<<SQL
-LOAD DATA LOCAL INFILE '{$escapedFile}'
-INTO TABLE `tag`
-FIELDS TERMINATED BY '\t'
-LINES TERMINATED BY '\n'
-SQL);
-                    unlink($file);
-                }
-            },
-            [$dsn, $dbUser, $dbPass, $tagFiles],
-        );
+        $nodeFuture = $nodeRuntime->run($importFn, [$this->dsn, $this->dbUser, $this->dbPass, 'node', $nodeFiles]);
+        $tagFuture = $tagRuntime->run($importFn, [$this->dsn, $this->dbUser, $this->dbPass, 'tag', $tagFiles]);
 
         $nodeFuture?->value();
         $tagFuture?->value();
@@ -169,46 +140,31 @@ SQL);
     {
         $this->logger->__invoke('Creating indexes');
 
-        $dsn = $this->dsn;
-        $dbUser = $this->dbUser;
-        $dbPass = $this->dbPass;
+        $indexFn = static function (string $dsn, string $user, string $pass, string $sql): void {
+            $pdo = new PDO(
+                dsn: $dsn,
+                username: $user,
+                password: $pass,
+                options: [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION],
+            );
+
+            $pdo->prepare($sql)->execute();
+        };
+
         $nodeRuntime = new Runtime();
         $tagRuntime = new Runtime();
 
-        $nodeFuture = $nodeRuntime->run(
-            static function (string $dsn, string $user, string $pass): void {
-                $pdo = new PDO(
-                    dsn: $dsn,
-                    username: $user,
-                    password: $pass,
-                    options: [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION],
-                );
-
-                $pdo->prepare(<<<SQL
+        $nodeFuture = $nodeRuntime->run($indexFn, [$this->dsn, $this->dbUser, $this->dbPass, <<<SQL
 ALTER TABLE `node`
 ADD PRIMARY KEY (`node_id`),
 ADD KEY idx_lat_lon (`lat`, `lon`)
-SQL)->execute();
-            },
-            [$dsn, $dbUser, $dbPass],
-        );
+SQL]);
 
-        $tagFuture = $tagRuntime->run(
-            static function (string $dsn, string $user, string $pass): void {
-                $pdo = new PDO(
-                    dsn: $dsn,
-                    username: $user,
-                    password: $pass,
-                    options: [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION],
-                );
-
-                $pdo->prepare(<<<SQL
+        $tagFuture = $tagRuntime->run($indexFn, [$this->dsn, $this->dbUser, $this->dbPass, <<<SQL
 ALTER TABLE `tag`
+ADD KEY `idx_node_id` (`node_id`),
 ADD KEY `idx_name_value_node_id` (`name`, `value`, `node_id`)
-SQL)->execute();
-            },
-            [$dsn, $dbUser, $dbPass],
-        );
+SQL]);
 
         $nodeFuture?->value();
         $tagFuture?->value();

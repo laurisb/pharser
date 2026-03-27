@@ -110,13 +110,10 @@ final class Parser
             $this->tagCsvFiles[] = $tagCsvFiles[$i];
         }
 
-        $workerRuntimes = [];
         $workerFutures = [];
 
         for ($i = 0; $i < $numThreads; $i++) {
             $runtime = new Runtime($autoloadPath);
-
-            $workerRuntimes[] = $runtime;
 
             $workerFutures[] = $runtime->run(
                 static function (

@@ -31,7 +31,7 @@ $defaultThreads = $detectedThreads > 0 ? $detectedThreads : 1;
 
 (new SingleCommandApplication())
     ->setName('PHARser')
-    ->setVersion('2.1.0')
+    ->setVersion('2.2.0')
     ->addArgument(
         name: 'pbf',
         mode: InputArgument::REQUIRED,
@@ -78,6 +78,11 @@ $defaultThreads = $detectedThreads > 0 ? $detectedThreads : 1;
         mode: InputOption::VALUE_NONE,
         description: 'Skip index creation',
     )
+    ->addOption(
+        name: 'keep-metadata',
+        mode: InputOption::VALUE_NONE,
+        description: 'Keep metadata tags (source, attribution, notes, etc.)',
+    )
     ->setCode(function (InputInterface $input, OutputInterface $output): int {
         try {
             /** @var string|null $pbfArg */
@@ -97,12 +102,15 @@ $defaultThreads = $detectedThreads > 0 ? $detectedThreads : 1;
                 throw new InvalidArgumentException('Thread count must be at least 1');
             }
 
+            $keepMetadata = (bool) $input->getOption('keep-metadata');
+
             $parser = new Parser(
                 pbfFile: $pbfFile,
                 nodeCsvBase: $pbfFile . '.nodes.csv',
                 tagCsvBase: $pbfFile . '.tags.csv',
                 logger: $logger,
                 numThreads: $threads,
+                skipMetadata: !$keepMetadata,
             );
 
             $skipIndexing = (bool) $input->getOption('skip-indexing');

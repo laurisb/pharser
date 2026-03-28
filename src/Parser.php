@@ -51,6 +51,7 @@ final class Parser
         private string $tagCsvBase,
         private Logger $logger,
         private int $numThreads,
+        private bool $skipMetadata,
     ) {
         if (!is_file($pbfFile)) {
             throw new InvalidArgumentException("PBF file not found: {$pbfFile}");
@@ -99,6 +100,7 @@ final class Parser
         $stopFlag = new Sync(false);
         $autoloadPath = __DIR__ . '/../vendor/autoload.php';
         $numThreads = $this->numThreads;
+        $skipMetadata = $this->skipMetadata;
         $nodeCsvFiles = [];
         $tagCsvFiles = [];
 
@@ -121,6 +123,7 @@ final class Parser
                     Sync $stop,
                     string $nodeCsvPath,
                     string $tagCsvPath,
+                    bool $skipMetadata,
                 ): array {
                     $fpNodes = fopen($nodeCsvPath, 'w');
                     $fpTags = fopen($tagCsvPath, 'w');
@@ -128,6 +131,7 @@ final class Parser
                     $processedBlocks = 0;
                     $processedNodes = 0;
                     $processedTags = 0;
+                    $skippedTags = 0;
                     $errors = 0;
                     $waysFound = false;
 
@@ -233,6 +237,12 @@ final class Parser
                                         continue;
                                     }
 
+                                    if ($skipMetadata && TagFilter::shouldSkip($stringsKey[$keyIdx])) {
+                                        $skippedTags++;
+
+                                        continue;
+                                    }
+
                                     $tagCount++;
                                     $tagPart .= "{$id}\t{$stringsKey[$keyIdx]}\t{$stringsVal[$valIdx]}\n";
                                 }
@@ -284,10 +294,11 @@ final class Parser
                         'blocks' => $processedBlocks,
                         'nodes' => $processedNodes,
                         'tags' => $processedTags,
+                        'skippedTags' => $skippedTags,
                         'errors' => $errors,
                     ];
                 },
-                [$blockChannel, $stopFlag, $nodeCsvFiles[$i], $tagCsvFiles[$i]],
+                [$blockChannel, $stopFlag, $nodeCsvFiles[$i], $tagCsvFiles[$i], $skipMetadata],
             );
         }
 
@@ -339,6 +350,7 @@ final class Parser
         $processedBlocks = 0;
         $processedNodes = 0;
         $processedTags = 0;
+        $skippedTags = 0;
         $processedErrors = 0;
 
         foreach ($workerFutures as $future) {
@@ -346,11 +358,12 @@ final class Parser
                 continue;
             }
 
-            /** @var array{blocks: int, nodes: int, tags: int, errors: int} $stats */
+            /** @var array{blocks: int, nodes: int, tags: int, skippedTags: int, errors: int} $stats */
             $stats = $future->value();
             $processedBlocks += $stats['blocks'];
             $processedNodes += $stats['nodes'];
             $processedTags += $stats['tags'];
+            $skippedTags += $stats['skippedTags'];
             $processedErrors += $stats['errors'];
         }
 
@@ -363,6 +376,11 @@ final class Parser
         $this->logger->__invoke('Blocks processed: ' . number_format($processedBlocks));
         $this->logger->__invoke('Nodes: ' . number_format($processedNodes));
         $this->logger->__invoke('Tags: ' . number_format($processedTags));
+
+        if ($skippedTags > 0) {
+            $this->logger->__invoke('Skipped tags: ' . number_format($skippedTags));
+        }
+
         $this->logger->__invoke('Nodes per second: ' . $nodesPerSecond);
         $this->logger->__invoke('Peak memory: ' . $peakMemory . ' MB');
         $this->logger->__invoke('Worker errors: ' . number_format($processedErrors));

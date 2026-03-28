@@ -85,6 +85,12 @@ The `--skip-indexing` option skips index creation (useful when indexes will be a
 php pharser.phar --skip-indexing /downloads/mordor.osm.pbf
 ```
 
+Metadata tags such as `source`, `attribution`, `note`, `created_by` and others are skipped by default, reducing database size by ~10% tags and ~5% nodes. Use `--keep-metadata` to retain them:
+
+```sh
+php pharser.phar --keep-metadata /downloads/mordor.osm.pbf
+```
+
 ### Advanced options
 
 ```sh
@@ -254,6 +260,7 @@ The figures below are for reference only and were measured in March 2026 on a 5-
 
 ## Changelog
 
+* **2026-03-28** - Skip metadata tags by default, add `--keep-metadata` option `v2.2.0`
 * **2026-03-27** - Restore missing index, CPU thread auto-detection `v2.1.0`
 * **2026-03-26** - Parser overhaul `v2.0.0`
 * **2025-07-03** - Initial release `v1.0.0`

@@ -260,6 +260,7 @@ The figures below are for reference only and were measured in March 2026 on a 5-
 
 ## Changelog
 
+* **2026-03-29** - String optimizations `v2.2.1`
 * **2026-03-28** - Skip metadata tags by default, add `--keep-metadata` option `v2.2.0`
 * **2026-03-27** - Restore missing index, CPU thread auto-detection `v2.1.0`
 * **2026-03-26** - Parser overhaul `v2.0.0`

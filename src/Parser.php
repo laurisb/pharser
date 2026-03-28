@@ -23,6 +23,7 @@ use function is_file;
 use function is_resource;
 use function is_string;
 use function max;
+use function mb_check_encoding;
 use function mb_convert_encoding;
 use function mb_substr;
 use function memory_get_peak_usage;
@@ -30,6 +31,7 @@ use function microtime;
 use function number_format;
 use function round;
 use function str_replace;
+use function stream_set_write_buffer;
 use function strlen;
 use function uniqid;
 use function unpack;
@@ -127,7 +129,6 @@ final class Parser
                 ): array {
                     $fpNodes = fopen($nodeCsvPath, 'w');
                     $fpTags = fopen($tagCsvPath, 'w');
-
                     $processedBlocks = 0;
                     $processedNodes = 0;
                     $processedTags = 0;
@@ -181,14 +182,31 @@ final class Parser
                         $stringsVal = [];
 
                         foreach ($strings as $s) {
-                            $clean = mb_convert_encoding($s, 'UTF-8', 'UTF-8');
-                            $stringsKey[] = mb_substr($clean, 0, 50, 'UTF-8');
+                            if (!preg_match('/[\x80-\xff]/', $s)) {
+                                $stringsKey[] = isset($s[50]) ? substr($s, 0, 50) : $s;
 
-                            $stringsVal[] = str_replace(
-                                ["\n", "\t"],
-                                [' ', ' '],
-                                mb_substr($clean, 0, 200, 'UTF-8'),
-                            );
+                                $stringsVal[] = str_replace(
+                                    ["\n", "\t"],
+                                    [' ', ' '],
+                                    isset($s[200]) ? substr($s, 0, 200) : $s,
+                                );
+                            } else {
+                                $clean = mb_check_encoding($s, 'UTF-8')
+                                    ? $s
+                                    : mb_convert_encoding($s, 'UTF-8', 'UTF-8');
+
+                                $stringsKey[] = strlen($clean) <= 50
+                                    ? $clean
+                                    : mb_substr($clean, 0, 50, 'UTF-8');
+
+                                $stringsVal[] = str_replace(
+                                    ["\n", "\t"],
+                                    [' ', ' '],
+                                    strlen($clean) <= 200
+                                        ? $clean
+                                        : mb_substr($clean, 0, 200, 'UTF-8'),
+                                );
+                            }
                         }
 
                         unset($strings);
@@ -198,6 +216,7 @@ final class Parser
                         $lonOffset = $block['lon_offset'];
                         $nodeBuffer = '';
                         $tagBuffer = '';
+                        $skipCache = [];
 
                         foreach ($block['groups'] as $group) {
                             if ($group['type'] === 'ways' || $group['type'] === 'relations') {
@@ -237,10 +256,16 @@ final class Parser
                                         continue;
                                     }
 
-                                    if ($skipMetadata && TagFilter::shouldSkip($stringsKey[$keyIdx])) {
-                                        $skippedTags++;
+                                    if ($skipMetadata) {
+                                        if (!isset($skipCache[$keyIdx])) {
+                                            $skipCache[$keyIdx] = TagFilter::shouldSkip($stringsKey[$keyIdx]);
+                                        }
 
-                                        continue;
+                                        if ($skipCache[$keyIdx]) {
+                                            $skippedTags++;
+
+                                            continue;
+                                        }
                                     }
 
                                     $tagCount++;

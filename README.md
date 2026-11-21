@@ -1,5 +1,7 @@
 # PHARser - Fast OpenStreetMap Node Importer for MySQL
 
+> **PHARser is no longer maintained.** Instead, check out its successor, [osm2mysql](https://github.com/laurisb/osm2mysql), which supports both nodes and closed ways (areas) rather than nodes alone, and streams planet-scale inputs via disk instead of holding everything in memory. Existing PHARser releases will remain available, though no further updates are planned.
+
 PHARser is a fast tool that extracts node coordinates and tag data from OpenStreetMap PBF files and loads them into a MySQL database, enabling location-based searches and geospatial and statistical analyses using SQL queries.
 
 [osm2pgsql](https://osm2pgsql.org) is the de-facto standard for importing OSM data. PHARser is for those who'd rather not age like a Hobbit [waiting for it to finish](https://wiki.openstreetmap.org/wiki/Osm2pgsql/benchmarks). It can import the full planet in [under four hours](#benchmarks).
